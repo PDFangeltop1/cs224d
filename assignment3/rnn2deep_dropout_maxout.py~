@@ -1,0 +1,397 @@
+import numpy as np
+import collections
+import pdb
+from nn.math import softmax, make_onehot
+
+# This is a 2-Layer Deep Recursive Neural Netowrk with two ReLU Layers and a softmax layer
+# You must update the forward and backward propogation functions of this file.
+
+# You can run this file via 'python rnn2deep.py' to perform a gradient check
+
+# tip: insert pdb.set_trace() in places where you are unsure whats going on
+
+
+# h2 -> output.  dropout h2,softmax
+# h1 -> h2       dropout h1, maxout
+# input -> h1    no dropout, ReLU
+
+
+class RNN2DropMaxout:
+
+    def __init__(self,wvecDim, middleDim, outputDim,numWords,mbSize=30,rho=1e-4,maxoutK = 4):
+        self.wvecDim = wvecDim
+        self.outputDim = outputDim
+        self.middleDim = middleDim
+        self.numWords = numWords
+        self.mbSize = mbSize
+        self.defaultVec = lambda : np.zeros((wvecDim,))
+        self.rho = rho
+        self.maxoutK = maxoutK 
+        
+    def initParams(self):
+        np.random.seed(12341)
+        # Word vectors
+        self.L = 0.01*np.random.randn(self.wvecDim,self.numWords)
+
+        # Hidden activation weights for layer 1
+        self.W1 = 0.01*np.random.randn(self.wvecDim,2*self.wvecDim)
+        self.b1 = np.zeros((self.wvecDim))
+
+        # Hidden activation weights for layer 2
+        self.W2 = 0.01*np.random.randn(self.maxoutK,self.middleDim,self.wvecDim)
+        self.b2 = np.zeros((self.maxoutK,self.middleDim))
+
+        # Softmax weights
+        self.Ws = 0.01*np.random.randn(self.outputDim,self.middleDim) # note this is " U " in the notes and the handout.. there is a reason for the change in notation
+        self.bs = np.zeros((self.outputDim))
+
+        self.stack = [self.L, self.W1, self.b1, self.W2, self.b2, self.Ws, self.bs]
+
+        # Gradients
+        self.dW1 = np.empty(self.W1.shape)
+        self.db1 = np.empty(self.b1.shape)
+        
+        self.dW2 = np.empty(self.W2.shape)
+        self.db2 = np.empty(self.b2.shape)
+
+        self.dWs = np.empty(self.Ws.shape)
+        self.dbs = np.empty(self.bs.shape)
+
+        self.dropoutP = 0.5
+        self.mask = self.dropout(self.middleDim,self.dropoutP)
+        self.mask1 = self.dropout(self.wvecDim, self.dropoutP)
+
+    def costAndGrad(self,mbdata,test=False): 
+        """
+        Each datum in the minibatch is a tree.
+        Forward prop each tree.
+        Backprop each tree.
+        Returns
+           cost
+           Gradient w.r.t. W1, W2, Ws, b1, b2, bs
+           Gradient w.r.t. L in sparse form.
+
+        or if in test mode
+        Returns 
+           cost, correctArray, guessArray, total
+        """
+        cost = 0.0
+        correct = []
+        guess = []
+        total = 0.0
+
+        self.L, self.W1, self.b1, self.W2, self.b2, self.Ws, self.bs = self.stack
+        # Zero gradients
+        self.dW1[:] = 0
+        self.db1[:] = 0
+        
+        self.dW2[:] = 0
+        self.db2[:] = 0
+
+        self.dWs[:] = 0
+        self.dbs[:] = 0
+        self.dL = collections.defaultdict(self.defaultVec)
+
+        # Forward prop each tree in minibatch
+        self.mask = self.dropout(self.middleDim,self.dropoutP)
+        self.mask1 = self.dropout(self.wvecDim, self.dropoutP)
+        
+        if test:
+            for tree in mbdata: 
+                c,tot = self.predict(tree.root,correct,guess)
+                cost += c
+                total += tot
+            return (1./len(mbdata))*cost,correct, guess, total
+
+
+
+        for tree in mbdata: 
+            c,tot = self.forwardProp(tree.root,correct,guess)
+            cost += c
+            total += tot
+
+        # Back prop each tree in minibatch
+        for tree in mbdata:
+            self.backProp(tree.root)
+
+        # scale cost and grad by mb size
+        scale = (1./self.mbSize)
+        for v in self.dL.itervalues():
+            v *=scale
+        
+        # Add L2 Regularization 
+        cost += (self.rho/2)*np.sum(self.W1**2)
+        #cost += (self.rho/2)*np.sum(self.W2**2)
+        tmpW2 = np.zeros(self.W2.shape)
+        for i in range(self.maxoutK):
+            tmpW2[i] = self.W2[i].dot(np.diag(self.mask1))            
+            cost += np.sum(tmpW2[i]**2)*self.rho/2
+
+        cost += (self.rho/2)*np.sum((self.Ws.dot(np.diag(self.mask)))**2)
+
+        return scale*cost,[self.dL,scale*(self.dW1 + self.rho*self.W1),scale*self.db1,
+                                   scale*(self.dW2 + self.rho*tmpW2),scale*self.db2,
+                                   scale*(self.dWs + self.rho*(self.Ws.dot(np.diag(self.mask)))),scale*self.dbs]
+
+
+    def dropout(self, shape, p, rng=None):
+        if rng is None:
+            rng = np.random.RandomState(123)
+        mask = rng.binomial(size=shape, n=1, p=1-p)
+        return mask
+
+    def ReLU(self,x):
+        return x*(x > 0)
+
+        #return 1.0/(1+np.exp(-x))
+
+    def df(self,x):
+        #f = self.ReLU(x)
+        #return f*(1-f)
+        return 1.0*(x > 0)
+
+
+    def maxout(self, Maxout):
+        m = np.max(Maxout,axis=0)
+        idx = np.argmax(Maxout,axis=0)
+        return m,idx
+    
+    def predict(self, node, correct=[], guess=[]):
+        cost  =  total = 0.0
+        # this is exactly the same setup as forwardProp in rnn.py
+        if node.isLeaf == True:
+            node.fprop = True
+            node.hActs1 = self.L[:,node.word]
+            #node.hActs2 = self.ReLU(self.W2.dot(node.hActs1)+self.b2)
+
+            tmp = node.hActs1*self.dropoutP
+            tmpMaxout = np.zeros((self.maxoutK, self.middleDim))
+            for i in range(self.maxoutK):
+                z = self.W2[i].dot(tmp)+self.b2[i]
+                tmpMaxout[i] = z
+            (node.hActs2, node.idx) = self.maxout(tmpMaxout)
+            
+            node.probs = softmax((self.Ws*self.dropoutP).dot(node.hActs1)+self.bs)
+            p = node.probs*make_onehot(node.label,len(self.bs))
+            cost = -np.log(np.sum(p))
+            correct.append(node.label)
+            guess.append(np.argmax(node.probs))
+            return cost, 1
+        
+        c1,t1 = self.forwardProp(node.left,correct,guess)
+        c2,t2 = self.forwardProp(node.right,correct,guess)
+        if node.left.fprop and node.right.fprop:
+            node.fprop = True
+            h = np.hstack([node.left.hActs1, node.right.hActs1])
+            node.hActs1 = self.ReLU(self.W1.dot(h) + self.b1)
+            #node.hActs2 = self.ReLU(self.W2.dot(node.hActs1)+self.b2)
+            tmp = node.hActs1*self.dropoutP
+            tmpMaxout = np.zeros((self.maxoutK,self.middleDim))
+            for i in range(self.maxoutK):
+                z = self.W2[i].dot(tmp)+self.b2[i]
+                tmpMaxout[i] = z
+            (node.hActs2, node.idx) = self.maxout(tmpMaxout)
+            
+            node.probs = softmax((self.Ws*self.dropoutP).dot(node.hActs2)+self.bs)
+            p = node.probs*make_onehot(node.label,len(self.bs))
+            cost = -np.log(np.sum(p))
+            correct.append(node.label)
+            guess.append(np.argmax(node.probs))
+            
+        cost += c1
+        cost += c2
+        total += t1
+        total += t2
+        return cost, total + 1
+
+        
+    def forwardProp(self,node, correct=[], guess=[]):
+        cost  =  total = 0.0
+        # this is exactly the same setup as forwardProp in rnn.py
+        if node.isLeaf == True:
+            node.fprop = True
+            node.hActs1 = self.L[:,node.word]
+            #node.hActs2 = self.ReLU(self.W2.dot(node.hActs1)+self.b2)
+
+            tmp = node.hActs1*self.mask1
+            tmpMaxout = np.zeros((self.maxoutK, self.middleDim))
+            for i in range(self.maxoutK):
+                z = self.W2[i].dot(tmp) + self.b2[i]
+                tmpMaxout[i] = z
+            (node.hActs2, node.idx) = self.maxout(tmpMaxout)
+            
+            node.probs = softmax(self.Ws.dot(node.hActs2*self.mask)+self.bs)
+            p = node.probs*make_onehot(node.label,len(self.bs))
+            cost = -np.log(np.sum(p))
+            correct.append(node.label)
+            guess.append(np.argmax(node.probs))
+            return cost, 1
+        
+        c1,t1 = self.forwardProp(node.left,correct,guess)
+        c2,t2 = self.forwardProp(node.right,correct,guess)
+        if node.left.fprop and node.right.fprop:
+            node.fprop = True
+            h = np.hstack([node.left.hActs1, node.right.hActs1])
+            node.hActs1 = self.ReLU(self.W1.dot(h) + self.b1)
+            #node.hActs2 = self.ReLU(self.W2.dot(node.hActs1)+self.b2)
+            tmp = node.hActs1*self.mask1
+            tmpMaxout = np.zeros((self.maxoutK, self.middleDim))
+            for i in range(self.maxoutK):
+                z = self.W2[i].dot(tmp) + self.b2[i]
+                tmpMaxout[i] = z
+            (node.hActs2, node.idx) = self.maxout(tmpMaxout)
+
+            node.probs = softmax(self.Ws.dot(node.hActs2*self.mask)+self.bs)
+            p = node.probs*make_onehot(node.label,len(self.bs))
+            cost = -np.log(np.sum(p))
+            correct.append(node.label)
+            guess.append(np.argmax(node.probs))
+            
+        cost += c1
+        cost += c2
+        total += t1
+        total += t2
+        return cost, total + 1
+
+
+    def backProp(self,node,error=None):
+        # Clear nodes
+        node.fprop = False
+        # this is exactly the same setup as backProp in rnn.py
+        errorCur = node.probs - make_onehot(node.label,len(self.bs))
+        self.dWs += np.outer(errorCur,node.hActs2*self.mask)
+        self.dbs += errorCur
+        #errorCur = errorCur.dot(self.Ws)*self.df(node.hActs2*self.mask)
+        errorCur = errorCur.dot(self.Ws)*self.mask
+        errorMatrixTmp = np.outer(errorCur,node.hActs1*self.mask1)
+        errorDownMatrix = np.zeros((self.middleDim,self.wvecDim))
+        for i in range(self.middleDim):
+            self.dW2[node.idx[i]][i] += errorMatrixTmp[i]
+            self.db2[node.idx[i]] += errorCur[i]
+            errorDownMatrix[i] = self.W2[node.idx[i]][i]
+        #self.dW2 += np.outer(errorCur,node.hActs1)
+        #self.db2 += errorCur
+        
+        #errorCur =  errorCur.dot(self.W2)
+        errorCur = errorCur.dot(errorDownMatrix)
+        if error is not None:
+            errorCur += error
+
+        errorCur *= self.mask1
+        if node.isLeaf == True:
+            self.dL[node.word] += errorCur
+            return
+
+        errorCur = errorCur*self.df(node.hActs1)
+        tmp1 = np.ones(self.W1.shape).dot(np.diag(np.hstack([node.left.hActs1, node.right.hActs1])))
+        self.dW1 += np.diag(errorCur).dot(tmp1)
+        self.db1 += errorCur
+
+        errorCur = errorCur.dot(self.W1)
+        self.backProp(node.left,errorCur[:self.wvecDim])
+        self.backProp(node.right,errorCur[self.wvecDim:])
+        
+        
+    def updateParams(self,scale,update,log=False):
+        """
+        Updates parameters as
+        p := p - scale * update.
+        If log is true, prints root mean square of parameter
+        and update.
+        """
+        if log:
+            for P,dP in zip(self.stack[1:],update[1:]):
+                pRMS = np.sqrt(np.mean(P**2))
+                dpRMS = np.sqrt(np.mean((scale*dP)**2))
+                print "weight rms=%f -- update rms=%f"%(pRMS,dpRMS)
+
+        self.stack[1:] = [P+scale*dP for P,dP in zip(self.stack[1:],update[1:])]
+
+        # handle dictionary update sparsely
+        dL = update[0]
+        for j in dL.iterkeys():
+            self.L[:,j] += scale*dL[j]
+
+    def toFile(self,fid):
+        import cPickle as pickle
+        pickle.dump(self.stack,fid)
+
+    def fromFile(self,fid):
+        import cPickle as pickle
+        self.stack = pickle.load(fid)
+
+    def check_grad(self,data,epsilon=1e-6):
+
+        cost, grad = self.costAndGrad(data)
+
+        err1 = 0.0
+        count = 0.0
+
+        cc = 0
+        print "Checking dWs, dW1 and dW2..."
+        for W,dW in zip(self.stack[1:],grad[1:]):
+            W = W[...,None,None] # add dimension since bias is flat
+            dW = dW[...,None,None]
+            cc += 1
+            for i in xrange(W.shape[0]):
+                for j in xrange(W.shape[1]):
+                    for k in xrange(W.shape[2]):
+                        W[i,j,k] += epsilon
+                        costP,_ = self.costAndGrad(data)
+                        W[i,j,k] -= epsilon
+                        numGrad = (costP - cost)/epsilon
+                        err = np.abs(dW[i,j,k] - numGrad)
+
+                        if err > 1e-5:
+                            print cc, " -> ",W.shape,"W[%d, %d, %d] = %.9f" %(i,j,k, err)
+                            err1+=err
+                            count+=1
+        if 0.001 > err1/count:
+            print "Grad Check Passed for dW Sum of Error = %.12f" % (err1/count)
+        else:
+            print "Grad Check Failed for dW: Sum of Error = %.12f" % (err1/count)
+        # check dL separately since dict
+        dL = grad[0]
+        L = self.stack[0]
+        err2 = 0.0
+        count = 0.0
+        print "Checking dL..."
+        for j in dL.iterkeys():
+            for i in xrange(L.shape[0]):
+                L[i,j] += epsilon
+                costP,_ = self.costAndGrad(data)
+                L[i,j] -= epsilon
+                numGrad = (costP - cost)/epsilon
+                err = np.abs(dL[j][i] - numGrad)
+                err2+=err
+                count+=1
+
+        if 0.001 > err2/count:
+            print "Grad Check Passed for dL Sum of Error = %.12f" % (err2/count)
+        else:
+            print "Grad Check Failed for dL: Sum of Error = %.12f" % (err2/count)
+
+if __name__ == '__main__':
+
+    import tree as treeM
+    train = treeM.loadTrees()
+    numW = len(treeM.loadWordMap())
+
+    print "numW = ", numW
+    wvecDim = 10
+    middleDim = 8
+    outputDim = 5
+
+    rnn = RNN2Drop(wvecDim,middleDim,outputDim,numW,mbSize=4)
+    rnn.initParams()
+
+    mbData = train[:4]
+    
+    print "Numerical gradient check..."
+    rnn.check_grad(mbData)
+
+
+
+
+
+

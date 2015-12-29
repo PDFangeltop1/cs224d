@@ -1,0 +1,116 @@
+import cPickle as pickle
+import sgd as optimizer
+from rnn import RNN
+from rntn import RNTN
+from rnn2deep_dropout import RNN2Drop
+from rnn2deep import RNN2
+from rnn2deep_dropout_maxout import RNN2DropMaxout
+import tree as tr
+import time
+import numpy as np
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+
+
+def plot_cost_acc(a, b, figname, epochs):
+    annotate_size = 0.15
+    if figname.startswith('Cost') == True:
+        annotate_size *= 30
+    
+    plt.figure(figsize=(6,4))
+    plt.title(figname)
+    plt.xlabel("SGD Iterations");plt.ylabel(r"Accuracy or Cost")
+    plt.ylim(ymin=min(min(a),min(b))*0.8,ymax=max(max(a),max(b))*1.2)
+    plt.plot(np.arange(epochs),a,'bo-')
+    plt.annotate("train_curve", xy=(1,a[1]),
+                 xytext=(1,a[1]+annotate_size),
+                 arrowprops=dict(facecolor='green'),
+                 horizontalalignment='left',verticalalignment='top')
+
+    plt.plot(np.arange(epochs),b,'ro-')
+    plt.annotate("dev_curve",xy=(50,b[50]),
+                 xytext=(50,b[50]+annotate_size),
+                 arrowprops=dict(facecolor='red'),
+                 horizontalalignment='left',verticalalignment='top')
+    plt.savefig("%s_per_epochs.png"%figname)
+    plt.close()
+
+def test(nn, trees):
+    cost, correct, guess, total = nn.costAndGrad(trees,test=True)
+    sum1 = 0
+    for i in range(len(correct)):
+        sum1 += (guess[i] == correct[i])
+    
+    return cost, sum1*1.0/(float(total))
+
+def run():
+    print "Loading data..."
+    model = "RNN"
+    trees = tr.loadTrees('train')
+    dev_trees = tr.loadTrees('dev')
+    wvecDimList = [5, 15, 25, 35, 45]
+    #wvecDimList = [10,20,40]
+    accuracy_per_wvecDim = []
+    epochs = 100
+    outFileText = "./param/%s/%s_cost_and_acc" % (model,model)
+    f = open(outFileText,'w')
+    for wvecDim in wvecDimList:
+        nn = RNN(wvecDim,5,len(tr.loadWordMap()),30)
+        nn.initParams()
+        sgd = optimizer.SGD(nn, alpha=0.01, minibatch=30, optimizer="adagrad")
+        outFile = "./param/%s/%s_wvecDim_%d_epochs_%d_step_001.bin" % (model,model,wvecDim,epochs)
+        
+        train_cost = []
+        train_acc =[]
+        dev_cost = []
+        dev_acc = []
+        cost = 0
+        accuracy = 0
+        for e in range(epochs):
+            start = time.time()
+            sgd.run(trees)
+            end = time.time()
+            print "Time per epoch : %f" % (end-start)
+            with open(outFile,'w') as fid:
+                hyperparam = {}
+                hyperparam['alpha'] = 0.01
+                hyperparam['minibatch'] = 30
+                hyperparam['wvecDim'] = wvecDim
+                pickle.dump(hyperparam,fid)
+                nn.toFile(fid)
+            
+            cost, accuracy = test(nn, trees)
+            train_cost.append(cost)
+            train_acc.append(accuracy)
+
+            cost, accuracy = test(nn, dev_trees)
+            dev_cost.append(cost)
+            dev_acc.append(accuracy)
+            
+            for tree in trees:
+                tr.leftTraverse(tree.root,nodeFn=tr.clearFprop)
+            for tree in dev_trees:
+                tr.leftTraverse(tree.root,nodeFn=tr.clearFprop)
+            print "fprop in trees cleared"
+        
+        plot_cost_acc(train_cost, dev_cost, "./figures/%s/%s_Cost_Figure_%d"%(model,model,wvecDim), epochs)
+        plot_cost_acc(train_acc, dev_acc, "./figures/%s/%s_Accuracy_Figure_%d"%(model,model,wvecDim),epochs)
+
+        anwser = "Cost = %f, Acc= %f" %(cost, accuracy)
+        f.write(anwser)
+        accuracy_per_wvecDim.append(accuracy) 
+        
+    f.close()
+    plt.figure(figsize=(6,4))
+    plt.title(r"Accuracies and vector Dimension")
+    plt.xlabel("vector Dimension");plt.ylabel(r"Accuracy")
+    plt.ylim(ymin=min(accuracy_per_wvecDim)*0.8,ymax=max(accuracy_per_wvecDim)*1.2)
+    plt.plot(wvecDimList,accuracy_per_wvecDim,color='b', marker='o', linestyle='-')
+    plt.savefig("./figures/%s/%s_Accuracy_and_vectorDimsension.png" % (model,model))
+    plt.close()
+
+if __name__ == '__main__':
+    run()
